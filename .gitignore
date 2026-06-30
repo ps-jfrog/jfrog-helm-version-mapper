@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Script output / scratch files
+*.log
+*.tmp
+output.json
+
+# The chart index is fetched at runtime and cached in $TMPDIR — never committed
+jfrog-helm-index.yaml
