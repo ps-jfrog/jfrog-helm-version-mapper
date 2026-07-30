@@ -18,6 +18,10 @@
 #   ./jfrog-helm-versions.sh artifactory --all --json  # all versions for chart, JSON
 #   ./jfrog-helm-versions.sh --list                    # list all chart names in index
 #   ./jfrog-helm-versions.sh --refresh                 # force re-download of index
+#   ./jfrog-helm-versions.sh jfrog-platform --dep xray=3.143.34     # find platform chart by bundled dep version
+#   ./jfrog-helm-versions.sh jfrog-platform --dep xray=103.143.34   # chart version also works
+#   ./jfrog-helm-versions.sh jfrog-platform --dep xray=3.143.34 --all    # all historical matches
+#   ./jfrog-helm-versions.sh jfrog-platform --dep xray=3.143.34 --json   # JSON output
 #
 # VERSIONING SCHEME (for reference)
 #   Artifactory chart:  107.X.Y  →  appVersion 7.X.Y
@@ -188,6 +192,163 @@ parse_chart_versions() {
   python3 - "${CACHE_FILE}" "$1" "$2" <<< "${PARSER_SCRIPT}"
 }
 
+# ── Dependency-version parser (for jfrog-platform and similar umbrella charts) ─
+# Parses the dependencies: block (4-space list items, 6-space fields) of each
+# chart entry and returns entries whose bundled dep matches the query.
+# Output columns: chart_ver <TAB> app_ver <TAB> date <TAB> dep_name <TAB> dep_ver
+DEP_PARSER_SCRIPT=$(cat << 'PYEOF'
+import sys, re
+
+index_file   = sys.argv[1]
+target_chart = sys.argv[2]
+dep_name_q   = sys.argv[3]   # e.g. "xray"; empty = search all deps
+dep_ver_q    = sys.argv[4]   # e.g. "103.143.34" or "3.143.34"
+
+def dep_matches(stored, query):
+    if stored == query:
+        return True
+    # Accept product-version shorthand: prepend "10" to match chart-version prefix.
+    # e.g. "3.143.34" -> "103.143.34", "7.146.34" -> "107.146.34", "2.52.2" -> "102.52.2"
+    if stored == '10' + query:
+        return True
+    return False
+
+results     = []
+in_entries  = False
+in_target   = False
+in_deps     = False
+current     = None   # current chart entry: {version, appVersion, created, deps:{}}
+current_dep = None   # current dep item:    {name, version}
+
+def flush_dep():
+    if current is not None and current_dep is not None:
+        n = current_dep.get('name', '')
+        v = current_dep.get('version', '')
+        if n and v:
+            current.setdefault('deps', {})[n] = v
+
+with open(index_file, 'r', encoding='utf-8') as fh:
+    for raw in fh:
+        line = raw.rstrip('\n')
+
+        if line == 'entries:':
+            in_entries = True
+            continue
+        if not in_entries:
+            continue
+        if line and not line[0].isspace():
+            break
+
+        # Chart name key at 2-space indent
+        m = re.match(r'^  ([a-zA-Z0-9_-]+):\s*$', line)
+        if m:
+            flush_dep()
+            if in_target and current is not None:
+                results.append(dict(current))
+            current = None
+            current_dep = None
+            in_deps = False
+            in_target = (m.group(1) == target_chart)
+            continue
+
+        if not in_target:
+            continue
+
+        # New chart entry list item at 2-space indent
+        if re.match(r'^  - ', line):
+            flush_dep()
+            if current is not None:
+                results.append(dict(current))
+            current = {'deps': {}}
+            current_dep = None
+            in_deps = False
+            continue
+
+        if current is None:
+            continue
+
+        # Entering dependencies block (4-space key)
+        if re.match(r'^    dependencies:\s*$', line):
+            in_deps = True
+            continue
+
+        if in_deps:
+            # New dep list item at 4-space indent.
+            # The item line itself may carry an inline field, e.g. "    - name: xray".
+            if re.match(r'^    - ', line):
+                flush_dep()
+                current_dep = {}
+                m = re.match(r'^    - (name|version):\s*"?([^"\n]+?)"?\s*$', line)
+                if m:
+                    current_dep[m.group(1)] = m.group(2)
+                continue
+            # Dep fields at 6-space indent
+            m = re.match(r'^      (name|version):\s*"?([^"\n]+?)"?\s*$', line)
+            if m:
+                if current_dep is not None:
+                    current_dep[m.group(1)] = m.group(2)
+                continue
+            # Leaving deps block: any 4-space non-list line (e.g. appVersion, version)
+            if re.match(r'^    [a-zA-Z]', line):
+                flush_dep()
+                current_dep = None
+                in_deps = False
+                # fall through to chart-field processing
+
+        # Chart-level fields at 4-space indent
+        if not in_deps:
+            m = re.match(r'^    (appVersion|version|created):\s*"?([^"\n]+?)"?\s*$', line)
+            if m:
+                current[m.group(1)] = m.group(2)
+
+# Flush trailing entry
+flush_dep()
+if in_target and current is not None:
+    results.append(dict(current))
+
+if not results:
+    print(f"NOTFOUND:{target_chart}")
+    sys.exit(0)
+
+results = [r for r in results if 'version' in r]
+
+def ver_key(r):
+    try:
+        return tuple(int(x) for x in r['version'].split('.'))
+    except Exception:
+        return (0,)
+
+results.sort(key=ver_key, reverse=True)
+
+matched = []
+for r in results:
+    deps = r.get('deps', {})
+    if dep_name_q:
+        dv = deps.get(dep_name_q, '')
+        if dv and dep_matches(dv, dep_ver_q):
+            matched.append((r, dep_name_q, dv))
+    else:
+        for dn, dv in sorted(deps.items()):
+            if dep_matches(dv, dep_ver_q):
+                matched.append((r, dn, dv))
+
+if not matched:
+    print("NOMATCH")
+    sys.exit(0)
+
+for r, dn, dv in matched:
+    v  = r.get('version',    'unknown')
+    av = r.get('appVersion', 'unknown')
+    dt = r.get('created',    '')[:10]
+    print(f"{v}\t{av}\t{dt}\t{dn}\t{dv}")
+PYEOF
+)
+
+parse_dep_versions() {
+  # args: chart_name  dep_name  dep_version_query
+  python3 - "${CACHE_FILE}" "$1" "$2" "$3" <<< "${DEP_PARSER_SCRIPT}"
+}
+
 # ── List all chart names from the index ──────────────────────────────────────
 list_charts() {
   python3 - "${CACHE_FILE}" << 'PYEOF'
@@ -236,6 +397,23 @@ json_row() {
     "$(_json_escape "$3")" "$(_json_escape "$4")"
 }
 
+print_dep_header() {
+  printf "${BOLD}%-26s  %-14s  %-14s  %-12s  %-16s  %s${RESET}\n" \
+    "CHART" "CHART VERSION" "APP VERSION" "RELEASED" "DEP" "DEP VERSION"
+  printf '%s\n' "$(python3 -c "print('─'*90)")"
+}
+
+print_dep_row() {
+  printf "${BOLD}%-26s${RESET}  ${CYAN}%-14s${RESET}  ${GREEN}%-14s${RESET}  ${DIM}%-12s${RESET}  ${YELLOW}%-16s${RESET}  ${CYAN}%s${RESET}\n" \
+    "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+json_dep_row() {
+  printf '  {"chart":"%s","chartVersion":"%s","appVersion":"%s","released":"%s","depName":"%s","depVersion":"%s"}' \
+    "$(_json_escape "$1")" "$(_json_escape "$2")" "$(_json_escape "$3")" \
+    "$(_json_escape "$4")" "$(_json_escape "$5")" "$(_json_escape "$6")"
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 main() {
   need_cmd curl
@@ -245,6 +423,7 @@ main() {
   local show_all=0
   local lookup_chart_ver=""
   local lookup_app_ver=""
+  local lookup_dep=""
   local json_out=0
   local force_refresh=0
   local do_list=0
@@ -259,6 +438,8 @@ main() {
                   lookup_chart_ver="$2"; shift 2 ;;
       --app)      [[ $# -ge 2 ]] || die "--app requires a version argument"
                   lookup_app_ver="$2"; shift 2 ;;
+      --dep)      [[ $# -ge 2 ]] || die "--dep requires a name=version argument (e.g. xray=3.143.34)"
+                  lookup_dep="$2"; shift 2 ;;
       --help|-h)
         grep '^#' "$0" 2>/dev/null | head -35 | sed 's/^# \{0,2\}//' || true
         exit 0 ;;
@@ -286,6 +467,47 @@ main() {
 
   local mode="latest"
   [[ "${show_all}" == "1" ]] && mode="all"
+
+  # ── Dependency version lookup (e.g. find jfrog-platform by bundled xray ver) ─
+  if [[ -n "${lookup_dep}" ]]; then
+    [[ -n "${target_chart}" ]] || die "Specify a chart name when using --dep (e.g. jfrog-platform)."
+    local dep_name dep_ver
+    dep_name="${lookup_dep%%=*}"
+    dep_ver="${lookup_dep##*=}"
+    [[ -n "${dep_name}" && -n "${dep_ver}" && "${lookup_dep}" == *=* ]] \
+      || die "--dep value must be in name=version format (e.g. xray=3.143.34)."
+
+    local rows
+    rows=$(parse_dep_versions "${target_chart}" "${dep_name}" "${dep_ver}")
+    if [[ "${rows}" == NOTFOUND:* ]]; then
+      die "Chart '${target_chart}' not found. Run --list for valid names."
+    fi
+    if [[ "${rows}" == "NOMATCH" ]]; then
+      die "No '${target_chart}' release found that bundles ${dep_name}=${dep_ver}."
+    fi
+
+    [[ "${json_out}" == "0" ]] && print_dep_header
+    local json_items=()
+    local printed=0
+    while IFS=$'\t' read -r cv av dt dn dv; do
+      [[ "${show_all}" == "0" && "${printed}" -ge 1 ]] && break
+      if [[ "${json_out}" == "0" ]]; then
+        print_dep_row "${target_chart}" "${cv}" "${av}" "${dt}" "${dn}" "${dv}"
+      else
+        json_items+=("$(json_dep_row "${target_chart}" "${cv}" "${av}" "${dt}" "${dn}" "${dv}")")
+      fi
+      (( printed++ )) || true
+    done <<< "${rows}"
+    if [[ "${json_out}" == "1" ]]; then
+      echo "["
+      local last=$(( ${#json_items[@]} - 1 ))
+      for i in "${!json_items[@]}"; do
+        [[ $i -lt $last ]] && echo "${json_items[$i]}," || echo "${json_items[$i]}"
+      done
+      echo "]"
+    fi
+    return
+  fi
 
   # ── Exact version lookups ─────────────────────────────────────────────────
   if [[ -n "${lookup_chart_ver}" || -n "${lookup_app_ver}" ]]; then

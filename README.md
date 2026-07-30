@@ -47,6 +47,45 @@ chmod +x jfrog-helm-versions.sh
 ./jfrog-helm-versions.sh --refresh
 ```
 
+## Dependency Lookup (`--dep`)
+
+The `jfrog-platform` umbrella chart bundles Artifactory, Xray, Distribution, and others. Its
+`appVersion` only tracks the **Artifactory** version, so `--app` cannot find it by Xray version.
+Use `--dep` to look up the platform chart by any bundled sub-chart version:
+
+```bash
+# Find the jfrog-platform chart that bundles Xray 3.143.34 (product version)
+./jfrog-helm-versions.sh jfrog-platform --dep xray=3.143.34
+
+# Chart version prefix also works
+./jfrog-helm-versions.sh jfrog-platform --dep xray=103.143.34
+
+# All historical platform releases that bundled that Xray version
+./jfrog-helm-versions.sh jfrog-platform --dep xray=3.143.34 --all
+
+# JSON output for CI/scripting
+./jfrog-helm-versions.sh jfrog-platform --dep xray=3.143.34 --json
+
+# Works for any bundled sub-chart (artifactory, distribution, catalog, worker, …)
+./jfrog-helm-versions.sh jfrog-platform --dep distribution=2.52.2
+```
+
+### `--dep` output
+
+```
+CHART          CHART VERSION   APP VERSION    RELEASED      DEP     DEP VERSION
+──────────────────────────────────────────────────────────────────────────────────
+jfrog-platform 11.5.13         7.146.34       2026-07-29    xray    103.143.34
+```
+
+### `--dep --json` output
+
+```json
+[
+  {"chart":"jfrog-platform","chartVersion":"11.5.13","appVersion":"7.146.34","released":"2026-07-29","depName":"xray","depVersion":"103.143.34"}
+]
+```
+
 ## Versioning Scheme
 
 JFrog's Helm charts encode a prefix in the chart version that corresponds to the product:
